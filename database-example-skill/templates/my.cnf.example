@@ -1,0 +1,25 @@
+# Example ~/.my.cnf for the `database-example-skill`.
+#
+# GENERIC EXAMPLE: hostnames and the port 6033 are placeholders — replace them with your own.
+#
+# Copy to ~/.my.cnf, replace YOUR_USER with your DB user (the one enabled on the proxy)
+# and apply chmod 600 (only your user can read it):
+#
+#   cp my.cnf.example ~/.my.cnf
+#   chmod 600 ~/.my.cnf
+#
+# IMPORTANT: this file carries NO password. The password lives encrypted in the macOS keychain
+# (service=db_example_password) and is injected by the wrapper scripts/db-connect. Never write the password here.
+#
+#   [client]     → prod, READ replica (db-replica). This is the default.
+#   [clientstg]  → staging, master (db-master). Used with --defaults-group-suffix=stg.
+
+[client]
+host=db-replica.internal.example.com
+port=6033
+user=YOUR_USER
+
+[clientstg]
+host=db-master.internal.example.com
+port=6033
+user=YOUR_USER

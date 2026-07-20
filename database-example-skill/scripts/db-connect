@@ -1,0 +1,147 @@
+#!/bin/sh
+# db-connect — MySQL prod/staging connection wrapper via a SQL proxy, for the `database-example-skill`.
+#
+# GENERIC EXAMPLE: keychain service (db_example_password), account var (DB_EXAMPLE_ACCOUNT)
+# and schema names are placeholders. Adapt them to your own infrastructure.
+#
+# What it does:
+#   - Injects the password from the macOS keychain (service=db_example_password) via MYSQL_PWD,
+#     so it never stays in the history or in `ps`.
+#   - Uses the mysql-client@8.4 client (some prod servers require mysql_native_password, removed in 9.x).
+#   - Picks the host per environment: prod → read replica ([client] of ~/.my.cnf),
+#     staging → master ([clientstg] via --defaults-group-suffix=stg).
+#   - Second security gate: in --env prod it ABORTS any statement that is not a read.
+#
+# This wrapper is the defense-in-depth gate. The primary gate (confirmation of writes on
+# staging, LIMIT, timeout, PII masking) is applied by the agent following SKILL.md.
+#
+# Usage:
+#   db-connect --env prod|staging <schema> [mysql args...]
+#
+# Examples:
+#   db-connect --env staging ORDERSSTG -e "SELECT 1"
+#   db-connect --env prod    ORDERSPRD -e "SELECT id FROM orders WHERE ... LIMIT 50"
+#
+# Prerequisites (see references/db-access.md): corporate VPN, user enabled on the proxy,
+#   brew install mysql-client@8.4, ~/.my.cnf configured, password stored in the keychain.
+
+set -eu
+
+usage() {
+  echo "usage: db-connect --env prod|staging <schema> [mysql args...]" >&2
+  exit 2
+}
+
+# --- Argument parsing ---------------------------------------------------------
+ENV_ARG=""
+SCHEMA=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env)
+      [ $# -ge 2 ] || usage
+      ENV_ARG="$2"
+      shift 2
+      ;;
+    --env=*)
+      ENV_ARG="${1#--env=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      # The first positional is the schema; the rest is passed as-is to mysql.
+      SCHEMA="$1"
+      shift
+      break
+      ;;
+  esac
+done
+
+[ -n "$ENV_ARG" ] || usage
+[ -n "$SCHEMA" ] || usage
+
+case "$ENV_ARG" in
+  prod|staging) ;;
+  *) echo "db-connect: --env must be 'prod' or 'staging' (received: '$ENV_ARG')." >&2; exit 2 ;;
+esac
+
+# --- Read-only gate on prod ---------------------------------------------------
+# IMPORTANT: this gate is defense in depth, NOT the primary guarantee. The real guarantee
+# that prod is read-only is: (a) connecting to the read replica ([client]/slave), and
+# (b) that the proxy DB user has SELECT-only grants on prod. See db-access.md.
+# Here we close the obvious client bypasses: we require -e/--execute (so mysql ignores stdin)
+# and validate that the verb is a read and that there is no multi-statement.
+if [ "$ENV_ARG" = "prod" ]; then
+  SQL=""
+  HAS_EXEC=0
+  # Reconstruct the SQL from the args (-e "..." or --execute=...) only to check it.
+  prev=""
+  for a in "$@"; do
+    case "$prev" in
+      -e|--execute) SQL="$a"; HAS_EXEC=1 ;;
+    esac
+    case "$a" in
+      --execute=*) SQL="${a#--execute=}"; HAS_EXEC=1 ;;
+      -e*) [ "$a" != "-e" ] && { SQL="${a#-e}"; HAS_EXEC=1; } ;;
+    esac
+    prev="$a"
+  done
+  # Without -e/--execute, mysql would read stdin (which we cannot validate) or open an
+  # interactive prompt. On prod we require -e so the query goes through the gate below.
+  if [ "$HAS_EXEC" -eq 0 ]; then
+    echo "db-connect: BLOCKED. On prod the query must be passed with -e \"SELECT ...\"." >&2
+    echo "            SQL via stdin or interactive session is not accepted (cannot validate)." >&2
+    exit 3
+  fi
+  if [ -n "$SQL" ]; then
+    # Normalize: strip hint comments and leading spaces, uppercase the first word.
+    FIRST=$(printf '%s' "$SQL" | sed -e 's|/\*[^*]*\*/||g' -e 's/^[[:space:]]*//' | awk '{print toupper($1)}')
+    case "$FIRST" in
+      SELECT|SHOW|EXPLAIN|DESCRIBE|DESC|WITH) ;;
+      *)
+        echo "db-connect: BLOCKED. Only reads are allowed on prod (SELECT/SHOW/EXPLAIN/DESCRIBE/WITH)." >&2
+        echo "            Rejected statement: '$FIRST ...'. Hand the SQL to the DBA to run it." >&2
+        exit 3
+        ;;
+    esac
+    # Multi-statement: the gate only looks at the first verb, so we reject an internal ';'
+    # (e.g. "SELECT 1; DELETE ..."). A single trailing ';' is allowed. It can false-positive
+    # on a ';' inside a literal — in that case run the query without the trailing ';'.
+    STRIPPED=$(printf '%s' "$SQL" | sed -e 's/[[:space:]]*;[[:space:]]*$//')
+    case "$STRIPPED" in
+      *\;*)
+        echo "db-connect: BLOCKED. Multiple statements are not accepted on prod (internal ';')." >&2
+        echo "            Run a single read query at a time." >&2
+        exit 3
+        ;;
+    esac
+  fi
+fi
+
+# --- Resolve the 8.4 binary ---------------------------------------------------
+PREFIX=$(brew --prefix mysql-client@8.4 2>/dev/null || true)
+MYSQL_BIN="$PREFIX/bin/mysql"
+[ -x "$MYSQL_BIN" ] || MYSQL_BIN="/opt/homebrew/opt/mysql-client@8.4/bin/mysql"
+if [ ! -x "$MYSQL_BIN" ]; then
+  echo "db-connect: cannot find mysql-client@8.4 (prod needs mysql_native_password, removed in 9.x)." >&2
+  echo "            Install with: brew install mysql-client@8.4" >&2
+  exit 1
+fi
+
+# --- Password from the keychain -----------------------------------------------
+ACCOUNT="${DB_EXAMPLE_ACCOUNT:-$(id -un)}"
+PASS=$(security find-generic-password -a "$ACCOUNT" -s db_example_password -w 2>/dev/null || true)
+if [ -z "$PASS" ]; then
+  echo "db-connect: no password in the keychain (account=$ACCOUNT, service=db_example_password)." >&2
+  echo "            Store it with: security add-generic-password -a \"$ACCOUNT\" -s db_example_password -w" >&2
+  exit 1
+fi
+
+# --- Execution ---------------------------------------------------------------
+# staging uses the [clientstg] group (master) via suffix; prod uses [client] (replica) by default.
+if [ "$ENV_ARG" = "staging" ]; then
+  MYSQL_PWD="$PASS" exec "$MYSQL_BIN" --defaults-group-suffix=stg --connect-timeout=10 "$SCHEMA" "$@"
+else
+  MYSQL_PWD="$PASS" exec "$MYSQL_BIN" --connect-timeout=10 "$SCHEMA" "$@"
+fi
